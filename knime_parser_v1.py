@@ -1,0 +1,164 @@
+import json
+import logging
+from typing import Dict, Any, List, Union
+
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("KnimeParser")
+
+class KnimeJsonParser:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.raw_data = None
+        self.ir_data = {
+            "project_context": {
+                "generated_at": "Automated Parser",
+                "target_language": "Python 3.10+",
+                "libraries": ["pandas", "numpy", "sqlalchemy", "connections_manager"]
+            },
+            "graph_structure": {
+                "nodes": [],
+                "execution_order": [] # Será preenchido baseada na topologia
+            }
+        }
+
+    def load(self):
+        """Carrega o JSON bruto exportado pelo KNIME."""
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                self.raw_data = json.load(f)
+            logger.info(f"Arquivo carregado com sucesso: {self.filepath}")
+        except Exception as e:
+            logger.error(f"Erro ao carregar arquivo: {e}")
+            raise
+
+    def _extract_typed_value(self, config_item: Dict) -> Any:
+        """
+        Remove a verbosidade de tipagem do KNIME.
+        Ex: {'type': 'xstring', 'value': 'ABC'} -> 'ABC'
+        """
+        # Se for um valor direto
+        if 'value' in config_item:
+            val = config_item['value']
+            typ = config_item.get('type', '')
+            
+            if typ == 'xboolean':
+                return str(val).lower() == 'true'
+            if typ == 'xint' or typ == 'xlong':
+                return int(val) if val else 0
+            if typ == 'xdouble':
+                return float(val) if val else 0.0
+            return val
+            
+        # Se for uma estrutura aninhada (settings)
+        if 'settings' in config_item:
+            return self._flatten_settings(config_item['settings'])
+            
+        return None
+
+    def _flatten_settings(self, settings_list: List[Dict]) -> Dict:
+        """
+        Função Recursiva Crítica:
+        Transforma a lista de chave-valor do KNIME em um dicionário Python limpo.
+        Lida com o aninhamento profundo visto na Imagem 5 (Rule Engine).
+        """
+        clean_dict = {}
+        
+        for item in settings_list:
+            key = item.get('key')
+            
+            # Recursão ou Extração
+            value = self._extract_typed_value(item)
+            
+            # Tratamento especial para arrays que o KNIME exporta como índices "0", "1", "2"
+            # O parser detecta se é um array disfarçado
+            clean_dict[key] = value
+
+        # Pós-processamento: Se o dicionário parece ser uma lista indexada (0, 1, 2...), converte para lista
+        if all(k.isdigit() for k in clean_dict.keys()):
+            # Ordena pelas chaves inteiras e retorna lista de valores
+            sorted_keys = sorted(clean_dict.keys(), key=int)
+            return [clean_dict[k] for k in sorted_keys]
+
+        return clean_dict
+
+    def _simplify_node_type(self, full_class_name: str) -> str:
+        """Extrai um nome legível do Java Class Name."""
+        if not full_class_name:
+            return "Unknown"
+        parts = full_class_name.split('.')
+        # Pega o último nome e remove sufixos comuns como 'NodeFactory'
+        name = parts[-1].replace('NodeFactory', '').replace('Node', '')
+        return name
+
+    def parse(self):
+        """Executa a conversão principal."""
+        if not self.raw_data:
+            self.load()
+
+        # O JSON de sumário do KNIME geralmente é uma lista de objetos ou um objeto com chaves
+        # Ajuste aqui dependendo se o JSON raiz é uma lista [] ou dict {}
+        nodes_list = self.raw_data if isinstance(self.raw_data, list) else self.raw_data.get('nodes', [])
+
+        parsed_nodes = []
+        
+        for node in nodes_list:
+            # Identificação básica
+            node_id = node.get('id', 'unknown')
+            node_name = node.get('name', 'Unnamed Node')
+            node_factory = node.get('factoryKey', {}).get('className', 'UnknownFactory')
+            
+            # Flattening da configuração (A mágica acontece aqui)
+            raw_settings = node.get('factoryKey', {}).get('settings', [])
+            # Tenta pegar settings do 'model' se não estiver na factory
+            if not raw_settings:
+                raw_settings = node.get('settings', []) # Fallback
+                
+            config = self._flatten_settings(raw_settings)
+
+            # Estrutura do Nó para a IA
+            node_ir = {
+                "id": node_id,
+                "original_name": node_name,
+                "simple_type": self._simplify_node_type(node_factory),
+                "full_type": node_factory,
+                "configuration": config,
+                "ports": {
+                    "inputs": node.get('inputs', []), # Captura info de portas
+                    "outputs": node.get('outputs', [])
+                },
+                # Sucessores para reconstruir o grafo
+                "successors": node.get('successors', [])
+            }
+            
+            parsed_nodes.append(node_ir)
+
+        self.ir_data["graph_structure"]["nodes"] = parsed_nodes
+        logger.info(f"Processamento concluído. {len(parsed_nodes)} nós convertidos.")
+        return self.ir_data
+
+    def save_ir(self, output_path: str):
+        """Salva o Arquivo Intermediário."""
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(self.ir_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Arquivo Intermediário salvo em: {output_path}")
+
+# --- BLOCO DE EXECUÇÃO (Exemplo) ---
+if __name__ == "__main__":
+    # 1. Defina o caminho do seu arquivo JSON exportado pelo KNIME
+    INPUT_FILE = "seu_workflow_knime.json"  # <--- COLOQUE O NOME DO SEU ARQUIVO AQUI
+    OUTPUT_FILE = "workflow_intermediario.json"
+
+    try:
+        # Instancia e roda
+        parser = KnimeJsonParser(INPUT_FILE)
+        parser.parse()
+        parser.save_ir(OUTPUT_FILE)
+        
+        print("\n--- SUCESSO ---")
+        print(f"O arquivo '{OUTPUT_FILE}' está pronto para ser enviado à IA.")
+        print("Verifique a seção 'configuration' no arquivo gerado para confirmar se as regras foram limpas.")
+        
+    except FileNotFoundError:
+        print(f"\n[ERRO] Não encontrei o arquivo '{INPUT_FILE}'.")
+        print("Por favor, exporte o resumo do workflow no KNIME e coloque na mesma pasta deste script.")
